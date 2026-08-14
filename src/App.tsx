@@ -5,18 +5,16 @@ import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import './App.css'
 import { clamp, createPet, tick, type PetState } from './features/pet/engine'
+import {
+  computeCropLayout,
+  FULL_CROP,
+  type CropRect,
+  type PetRecord,
+} from './features/pet/crop'
+import { Editor } from './features/editor/Editor'
 
 const allowedTypes = ['image/png', 'image/jpeg', 'image/webp']
 const maxFileSize = 10 * 1024 * 1024
-
-interface PetRecord {
-  file_name: string | null
-  display_name: string | null
-  path: string | null
-  x: number | null
-  y: number | null
-  direction: number | null
-}
 
 interface WorkArea {
   x: number
@@ -27,6 +25,21 @@ interface WorkArea {
 }
 
 function App() {
+  const [windowLabel, setWindowLabel] = useState('main')
+  const desktopRuntime = '__TAURI_INTERNALS__' in window
+
+  useEffect(() => {
+    if (desktopRuntime) {
+      setWindowLabel(getCurrentWindow().label)
+    }
+  }, [desktopRuntime])
+
+  if (!desktopRuntime) return <WebPrototype />
+  if (windowLabel === 'editor') return <Editor />
+  return <DesktopPet />
+}
+
+function WebPrototype() {
   const [pet, setPet] = useState<PetState>(() => createPet({ x: 0, y: 0, width: 860, height: 420 }))
   const [imageUrl, setImageUrl] = useState<string | null>(null)
   const [fileName, setFileName] = useState('示例宠物（仅演示）')
@@ -58,11 +71,8 @@ function App() {
     setNotice('仅在此浏览器预览中读取图片；桌面版将把文件复制到本地应用数据目录。')
   }
 
-  const desktopRuntime = '__TAURI_INTERNALS__' in window
-
   return (
-    <main className={desktopRuntime ? 'pet-window' : 'app-shell'}>
-      {desktopRuntime ? <DesktopPet /> : <>
+    <main className="app-shell">
       <header>
         <p className="eyebrow">PHOTO DESKTOP PET · WINDOWS MVP</p>
         <h1>让有授权的照片，成为你的桌面伙伴。</h1>
@@ -101,70 +111,83 @@ function App() {
       </section>
 
       <footer><span>{notice}</span><a href="https://github.com" target="_blank">准备开源</a></footer>
-      </>}
     </main>
   )
 }
 
+function loadImageSize(src: string): Promise<{ w: number; h: number }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight })
+    img.onerror = () => reject(new Error('image load failed'))
+    img.src = src
+  })
+}
+
 function DesktopPet() {
-  const [image, setImage] = useState<{ src: string; name: string } | null>(null)
+  const [image, setImage] = useState<{ src: string; name: string; w: number; h: number } | null>(null)
+  const [crop, setCrop] = useState<CropRect>(FULL_CROP)
+  const [scale, setScale] = useState(1)
   const petRef = useRef<PetState | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
 
-  const refresh = useCallback(async () => {
+  const cropLayout = image ? computeCropLayout(image.w, image.h, crop, scale) : null
+
+  // 完整（重新）初始化：读配置 → 加载图片 → 设窗口尺寸 → 重建引擎与位置
+  const setupPet = useCallback(async () => {
     try {
       const record = await invoke<PetRecord | null>('load_pet_state')
-      setImage(record?.path ? { src: convertFileSrc(record.path), name: record.display_name ?? 'pet' } : null)
-    } catch {
-      setImage(null)
+      const workArea = await invoke<WorkArea>('get_work_area')
+      const win = getCurrentWindow()
+      const anchorY = record?.anchor_y ?? 1
+      const crop0 = record?.crop ?? FULL_CROP
+      const scale0 = record?.scale ?? 1
+      setCrop(crop0)
+      setScale(scale0)
+
+      let size = await win.outerSize()
+      if (record?.path) {
+        const src = convertFileSrc(record.path)
+        const { w, h } = await loadImageSize(src)
+        setImage({ src, name: record.display_name ?? 'pet', w, h })
+        if (record.crop && record.scale) {
+          const layout = computeCropLayout(w, h, crop0, scale0)
+          await invoke('set_window_size', { width: layout.width, height: layout.height }).catch(() => {})
+          size = await win.outerSize()
+        }
+      } else {
+        setImage(null)
+      }
+
+      const sizeObj = { width: size.width, height: size.height }
+      let bounds = workArea
+      let pet = createPet(bounds, sizeObj, anchorY)
+      if (record?.x != null && record?.y != null) {
+        const x = record.x
+        const y = record.y
+        await invoke('set_pet_position', { x, y }).catch(() => {})
+        bounds = await invoke<WorkArea>('get_work_area').catch(() => workArea)
+        const maxX = Math.max(bounds.x, bounds.x + bounds.width - sizeObj.width)
+        const maxY = Math.max(bounds.y, bounds.y + bounds.height - anchorY * sizeObj.height)
+        pet = { ...pet, bounds, x: clamp(x, bounds.x, maxX), y: clamp(y, bounds.y, maxY) }
+      }
+      pet = { ...pet, direction: record?.direction === -1 ? -1 : 1 }
+      petRef.current = pet
+      await invoke('set_pet_position', { x: pet.x, y: pet.y }).catch(() => {})
+      console.log('[diagnostic] setupPet: bounds=', bounds, '| size=', sizeObj, '| pos=', { x: pet.x, y: pet.y }, '| anchorY=', anchorY)
+    } catch (e) {
+      console.error(e)
     }
   }, [])
 
-  // 初始化：运行时动态探测（不假设任何 DPI），统一屏幕绝对坐标
   useEffect(() => {
-    let disposed = false
-    const win = getCurrentWindow()
-    ;(async () => {
-      try {
-        const [record, workArea, winSize] = await Promise.all([
-          invoke<PetRecord | null>('load_pet_state'),
-          invoke<WorkArea>('get_work_area'),
-          win.outerSize(),
-        ])
-        if (disposed) return
-        const size = { width: winSize.width, height: winSize.height }
-        let bounds = workArea
-        let x = workArea.x + (workArea.width - size.width) / 2
-        let y = workArea.y + workArea.height - size.height
-        if (record?.x != null && record?.y != null) {
-          // 用保存的屏幕绝对坐标；先移动窗口，再取窗口实际所在显示器的工作区
-          x = record.x
-          y = record.y
-          await invoke('set_pet_position', { x, y }).catch(() => {})
-          bounds = await invoke<WorkArea>('get_work_area').catch(() => workArea)
-          const maxX = Math.max(bounds.x, bounds.x + bounds.width - size.width)
-          const maxY = Math.max(bounds.y, bounds.y + bounds.height - size.height)
-          x = clamp(x, bounds.x, maxX)
-          y = clamp(y, bounds.y, maxY)
-        }
-        console.log('[diagnostic] scale=', bounds.scale, '| bounds=', bounds, '| size=', size, '| pos=', { x, y })
-        let pet = createPet(bounds, size)
-        pet = { ...pet, x, y, direction: record?.direction === -1 ? -1 : 1 }
-        petRef.current = pet
-        if (record?.path) {
-          setImage({ src: convertFileSrc(record.path), name: record.display_name ?? 'pet' })
-        }
-        await invoke('set_pet_position', { x: pet.x, y: pet.y }).catch(() => {})
-      } catch (e) {
-        console.error(e)
-      }
-    })()
+    setupPet()
     let un1: (() => void) | undefined
     let un2: (() => void) | undefined
-    listen('pet-changed', () => refresh()).then((u) => { un1 = u })
+    listen('pet-changed', () => setupPet()).then((u) => { un1 = u })
     listen<string>('pet-error', (e) => console.error(e.payload)).then((u) => { un2 = u })
-    return () => { disposed = true; un1?.(); un2?.() }
-  }, [refresh])
+    return () => { un1?.(); un2?.() }
+  }, [setupPet])
 
   // 动画循环：tick 引擎（屏幕绝对坐标）+ 节流同步窗口位置（拖拽期间由 Rust 控制窗口）
   useEffect(() => {
@@ -200,7 +223,7 @@ function DesktopPet() {
         if (!p) return
         const nextBounds = bounds ?? p.bounds
         const maxX = Math.max(nextBounds.x, nextBounds.x + nextBounds.width - p.size.width)
-        const maxY = Math.max(nextBounds.y, nextBounds.y + nextBounds.height - p.size.height)
+        const maxY = Math.max(nextBounds.y, nextBounds.y + nextBounds.height - p.anchorY * p.size.height)
         petRef.current = {
           ...p,
           bounds: nextBounds,
@@ -235,11 +258,24 @@ function DesktopPet() {
     <div
       ref={containerRef}
       className="native-pet"
-      title="拖拽可移动，从系统托盘导入或删除图片"
+      title="拖拽可移动，从系统托盘导入或编辑图片"
     >
-      {image
-        ? <img src={image.src} alt={`${image.name} 的桌宠`} draggable={false} />
-        : <div className="sample-pet" aria-label="抽象示例宠物"><i /><b /><em /></div>}
+      {image && cropLayout ? (
+        <div className="crop-viewport">
+          <img
+            src={image.src}
+            alt={`${image.name} 的桌宠`}
+            draggable={false}
+            style={{
+              width: cropLayout.imgWidth,
+              height: cropLayout.imgHeight,
+              transform: `translate(${cropLayout.translateX}px, ${cropLayout.translateY}px)`,
+            }}
+          />
+        </div>
+      ) : (
+        <div className="sample-pet" aria-label="抽象示例宠物"><i /><b /><em /></div>
+      )}
     </div>
   )
 }

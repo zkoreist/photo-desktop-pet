@@ -26,6 +26,8 @@ export interface PetState {
   mode: PetMode
   bounds: Bounds
   size: Size
+  /** 贴地锚点的垂直位置（相对窗口高度 0-1），1 = 脚底在窗口最底部。 */
+  anchorY: number
   idleTimer: number
   walkTimer: number
 }
@@ -52,16 +54,22 @@ export function mulberry32(seed: number): Rng {
   }
 }
 
-export function createPet(bounds: Bounds, size: Size = { width: 140, height: 160 }): PetState {
+export function createPet(
+  bounds: Bounds,
+  size: Size = { width: 140, height: 160 },
+  anchorY = 1,
+): PetState {
+  const feetY = anchorY * size.height
   return {
     x: bounds.x + clamp((bounds.width - size.width) / 2, 0, Math.max(0, bounds.width - size.width)),
-    y: bounds.y + Math.max(0, bounds.height - size.height),
+    y: bounds.y + Math.max(0, bounds.height - feetY),
     vy: 0,
     direction: 1,
     speed: 68,
     mode: 'walking',
     bounds,
     size,
+    anchorY,
     idleTimer: 0,
     walkTimer: 2500,
   }
@@ -81,7 +89,8 @@ export function tick(pet: PetState, elapsedMs: number, rng: Rng = Math.random): 
   const minX = pet.bounds.x
   const minY = pet.bounds.y
   const maxX = pet.bounds.x + Math.max(0, pet.bounds.width - pet.size.width)
-  const maxY = pet.bounds.y + Math.max(0, pet.bounds.height - pet.size.height)
+  const feetY = pet.anchorY * pet.size.height
+  const maxY = pet.bounds.y + Math.max(0, pet.bounds.height - feetY)
 
   if (pet.mode === 'idle') {
     const idleTimer = pet.idleTimer - elapsedMs

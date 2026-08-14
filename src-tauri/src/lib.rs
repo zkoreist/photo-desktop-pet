@@ -9,7 +9,16 @@ mod drag;
 
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
-/// 持久化的宠物状态：图片引用（可选）+ 窗口位置（可选）。
+/// 裁剪区域（相对原图 0-1 的比例）。
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
+pub(crate) struct CropRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// 持久化的宠物状态：图片引用 + 窗口位置 + 裁剪/缩放/锚点（可选）。
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub(crate) struct PetState {
     file_name: Option<String>,
@@ -18,6 +27,10 @@ pub(crate) struct PetState {
     x: Option<f64>,
     y: Option<f64>,
     direction: Option<i32>,
+    crop: Option<CropRect>,
+    scale: Option<f64>,
+    anchor_x: Option<f64>,
+    anchor_y: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -45,6 +58,45 @@ fn state_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("无法获取应用数据目录: {e}"))?;
     Ok(dir.join("pet_state.json"))
+}
+
+/// 读取图片像素尺寸（只解码头部，不加载全图）。
+fn image_dimensions(path: &std::path::Path) -> Result<(u32, u32), String> {
+    image::image_dimensions(path).map_err(|e| format!("无法读取图片尺寸: {e}"))
+}
+
+/// 计算裁剪+缩放后的窗口尺寸（逻辑像素，与图片像素 1:1）。
+/// 无裁剪/缩放配置时返回 (0, 0)。
+fn computed_window_size(state: &PetState) -> Result<(f64, f64), String> {
+    let (crop, scale) = match (state.crop, state.scale) {
+        (Some(c), Some(s)) => (c, s),
+        _ => return Ok((0.0, 0.0)),
+    };
+    if !scale.is_finite() || scale <= 0.0 || crop.width <= 0.0 || crop.height <= 0.0 {
+        return Err("裁剪/缩放参数无效".into());
+    }
+    let path = state.path.as_deref().ok_or("当前没有已导入的图片")?;
+    let (w0, h0) = image_dimensions(std::path::Path::new(path))?;
+    let fw = (w0 as f64 * crop.width * scale).round().max(1.0);
+    let fh = (h0 as f64 * crop.height * scale).round().max(1.0);
+    Ok((fw, fh))
+}
+
+/// 根据 state 里的裁剪/缩放配置把主窗口调整到目标尺寸；无配置时保持默认。
+fn apply_window_size(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = load_state(app)?.unwrap_or_default();
+    let Ok((fw, fh)) = computed_window_size(&state) else {
+        return Ok(());
+    };
+    if fw <= 0.0 || fh <= 0.0 {
+        return Ok(());
+    }
+    if let Some(win) = app.get_webview_window("main") {
+        use tauri::Size;
+        win.set_size(Size::Logical(tauri::LogicalSize::new(fw, fh)))
+            .map_err(|e| format!("设置窗口尺寸失败: {e}"))?;
+    }
+    Ok(())
 }
 
 /// 校验扩展名白名单、大小上限与真实图片内容（magic bytes）。
@@ -207,6 +259,75 @@ fn get_pet_position(window: tauri::WebviewWindow) -> Result<(i32, i32), String> 
     Ok((pos.x, pos.y))
 }
 
+/// 保存裁剪/缩放/锚点配置，并把主窗口调整到对应尺寸。
+#[tauri::command]
+fn save_pet_config(
+    app: tauri::AppHandle,
+    crop: CropRect,
+    scale: f64,
+    anchor_x: f64,
+    anchor_y: f64,
+) -> Result<(), String> {
+    let crop = CropRect {
+        x: crop.x.clamp(0.0, 1.0),
+        y: crop.y.clamp(0.0, 1.0),
+        width: crop.width.clamp(0.0, 1.0),
+        height: crop.height.clamp(0.0, 1.0),
+    };
+    if crop.width <= 0.0 || crop.height <= 0.0 {
+        return Err("裁剪区域无效".into());
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("缩放比例无效".into());
+    }
+
+    let mut state = load_state(&app)?.unwrap_or_default();
+    if state.path.is_none() {
+        return Err("当前没有已导入的图片".into());
+    }
+    state.crop = Some(crop);
+    state.scale = Some(scale);
+    state.anchor_x = Some(anchor_x.clamp(0.0, 1.0));
+    state.anchor_y = Some(anchor_y.clamp(0.0, 1.0));
+    write_state(&app, &state)?;
+    apply_window_size(&app)?;
+    let _ = app.emit("pet-changed", ());
+    Ok(())
+}
+
+/// 打开编辑器窗口。
+#[tauri::command]
+fn open_editor(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("editor") {
+        win.show().map_err(|e| e.to_string())?;
+        win.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 关闭编辑器窗口（隐藏，不销毁）。
+#[tauri::command]
+fn close_editor(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("editor") {
+        let _ = win.hide();
+    }
+    Ok(())
+}
+
+/// 直接设置主窗口尺寸（逻辑像素）。前端在图片尺寸已知后调用，消除启动竞态。
+#[tauri::command]
+fn set_window_size(app: tauri::AppHandle, width: f64, height: f64) -> Result<(), String> {
+    if width <= 0.0 || height <= 0.0 || !width.is_finite() || !height.is_finite() {
+        return Err("窗口尺寸无效".into());
+    }
+    if let Some(win) = app.get_webview_window("main") {
+        use tauri::Size;
+        win.set_size(Size::Logical(tauri::LogicalSize::new(width, height)))
+            .map_err(|e| format!("设置窗口尺寸失败: {e}"))?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     use tauri::menu::{Menu, MenuItem};
@@ -221,14 +342,19 @@ pub fn run() {
             get_work_area,
             set_pet_position,
             get_pet_position,
+            save_pet_config,
+            open_editor,
+            close_editor,
+            set_window_size,
             drag::begin_press
         ])
         .setup(|app| {
             let show_hide = MenuItem::with_id(app, "show-hide", "显示 / 隐藏", true, None::<&str>)?;
             let import = MenuItem::with_id(app, "import", "导入图片…", true, None::<&str>)?;
+            let edit = MenuItem::with_id(app, "edit", "编辑图片…", true, None::<&str>)?;
             let delete = MenuItem::with_id(app, "delete", "删除当前图片", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_hide, &import, &delete, &quit])?;
+            let menu = Menu::with_items(app, &[&show_hide, &import, &edit, &delete, &quit])?;
             let icon = app.default_window_icon().cloned().expect("application icon is required");
             TrayIconBuilder::with_id("main-tray")
                 .icon(icon)
@@ -236,6 +362,9 @@ pub fn run() {
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show-hide" => toggle_window(app.get_webview_window("main")),
+                    "edit" => {
+                        let _ = open_editor(app.clone());
+                    }
                     "import" => {
                         let handle = app.clone();
                         tauri::async_runtime::spawn_blocking(move || match import_blocking(&handle) {
@@ -280,6 +409,13 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            // 启动时按已保存的裁剪/缩放配置调整主窗口尺寸
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(e) = apply_window_size(&handle) {
+                    log::warn!("[diagnostic] apply_window_size: {e}");
+                }
+            });
             Ok(())
         })
         .run(tauri::generate_context!())

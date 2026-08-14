@@ -22,6 +22,15 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "shadow": false
+      },
+      {
+        "label": "editor",
+        "title": "编辑桌宠图片",
+        "width": 900,
+        "height": 700,
+        "resizable": true,
+        "visible": false,
+        "center": true
       }
     ],
     "security": {

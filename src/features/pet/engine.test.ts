@@ -138,3 +138,31 @@ describe('engine · 多显示器负坐标（副屏在主屏左侧/上方）', ()
     }
   })
 })
+
+describe('engine · 贴地锚点 anchorY', () => {
+  const size = { width: 140, height: 160 }
+
+  it('anchorY 默认 1：窗口底边贴地（等价旧行为）', () => {
+    const pet = createPet(bounds, size)
+    expect(pet.anchorY).toBe(1)
+    expect(pet.y).toBe(600 - 160)
+  })
+
+  it('anchorY=0.5：锚点（脚底）贴地，窗口中心对齐地面', () => {
+    const pet = withOverrides(createPet(bounds, size, 0.5), { y: 100, vy: 100 })
+    let p = pet
+    for (let i = 0; i < 200; i++) p = tick(p, 16, () => 1)
+    expect(p.y + 0.5 * size.height).toBeCloseTo(600)
+    expect(p.vy).toBe(0)
+  })
+
+  it('anchorY 长时间模拟：锚点始终不越界', () => {
+    let pet = createPet(bounds, size, 0.6)
+    const rng = mulberry32(5)
+    for (let i = 0; i < 20000; i++) {
+      pet = tick(pet, 16, rng)
+      expect(pet.y).toBeGreaterThanOrEqual(bounds.y)
+      expect(pet.y + 0.6 * size.height).toBeLessThanOrEqual(bounds.y + bounds.height + 0.001)
+    }
+  })
+})
