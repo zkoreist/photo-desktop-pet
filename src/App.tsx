@@ -1,10 +1,29 @@
-import { useEffect, useRef, useState } from 'react'
-import type { ChangeEvent } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { ChangeEvent, PointerEvent } from 'react'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import './App.css'
 import { createPet, tick, type PetState } from './features/pet/engine'
 
 const allowedTypes = ['image/png', 'image/jpeg', 'image/webp']
 const maxFileSize = 10 * 1024 * 1024
+
+interface PetRecord {
+  file_name: string | null
+  display_name: string | null
+  path: string | null
+  x: number | null
+  y: number | null
+  direction: number | null
+}
+
+interface WorkArea {
+  x: number
+  y: number
+  width: number
+  height: number
+}
 
 function App() {
   const [pet, setPet] = useState<PetState>(() => createPet({ width: 860, height: 420 }))
@@ -42,7 +61,7 @@ function App() {
 
   return (
     <main className={desktopRuntime ? 'pet-window' : 'app-shell'}>
-      {desktopRuntime ? <PetOnly imageUrl={imageUrl} fileName={fileName} /> : <>
+      {desktopRuntime ? <DesktopPet /> : <>
       <header>
         <p className="eyebrow">PHOTO DESKTOP PET · WINDOWS MVP</p>
         <h1>让有授权的照片，成为你的桌面伙伴。</h1>
@@ -86,10 +105,145 @@ function App() {
   )
 }
 
-function PetOnly({ imageUrl, fileName }: { imageUrl: string | null; fileName: string }) {
-  return <div className="native-pet" title="从系统托盘打开或退出">
-    {imageUrl ? <img src={imageUrl} alt={`${fileName} 的桌宠`} /> : <div className="sample-pet" aria-label="抽象示例宠物"><i /><b /><em /></div>}
-  </div>
+function DesktopPet() {
+  const [image, setImage] = useState<{ src: string; name: string } | null>(null)
+  const petRef = useRef<PetState | null>(null)
+  const workAreaRef = useRef<WorkArea>({ x: 0, y: 0, width: 860, height: 420 })
+  const draggingRef = useRef(false)
+  const movedRef = useRef(false)
+
+  const refresh = useCallback(async () => {
+    try {
+      const record = await invoke<PetRecord | null>('load_pet_state')
+      setImage(record?.path ? { src: convertFileSrc(record.path), name: record.display_name ?? 'pet' } : null)
+    } catch {
+      setImage(null)
+    }
+  }, [])
+
+  // 初始化：加载状态 + 工作区 + 就位
+  useEffect(() => {
+    let disposed = false
+    ;(async () => {
+      try {
+        const [record, workArea] = await Promise.all([
+          invoke<PetRecord | null>('load_pet_state'),
+          invoke<WorkArea>('get_work_area'),
+        ])
+        if (disposed) return
+        workAreaRef.current = workArea
+        const size = { width: 140, height: 160 }
+        let pet = createPet({ width: workArea.width, height: workArea.height }, size)
+        if (record?.x != null && record?.y != null) {
+          pet = { ...pet, x: record.x, y: record.y, direction: record.direction === -1 ? -1 : 1 }
+        }
+        petRef.current = pet
+        if (record?.path) {
+          setImage({ src: convertFileSrc(record.path), name: record.display_name ?? 'pet' })
+        }
+        await invoke('set_pet_position', {
+          x: Math.round(workArea.x + pet.x),
+          y: Math.round(workArea.y + pet.y),
+        }).catch(() => {})
+      } catch (e) {
+        console.error(e)
+      }
+    })()
+    let un1: (() => void) | undefined
+    let un2: (() => void) | undefined
+    listen('pet-changed', () => refresh()).then((u) => { un1 = u })
+    listen<string>('pet-error', (e) => console.error(e.payload)).then((u) => { un2 = u })
+    return () => { disposed = true; un1?.(); un2?.() }
+  }, [refresh])
+
+  // 动画循环：tick 引擎 + 节流同步窗口位置
+  useEffect(() => {
+    let raf = 0
+    let last = performance.now()
+    let lastSync = 0
+    const loop = (now: number) => {
+      const dt = now - last
+      last = now
+      const pet = petRef.current
+      if (pet && !draggingRef.current && pet.mode !== 'paused') {
+        petRef.current = tick(pet, dt)
+      }
+      const p = petRef.current
+      if (p && !draggingRef.current && now - lastSync > 100) {
+        lastSync = now
+        const wa = workAreaRef.current
+        invoke('set_pet_position', {
+          x: Math.round(wa.x + p.x),
+          y: Math.round(wa.y + p.y),
+        }).catch(() => {})
+      }
+      raf = requestAnimationFrame(loop)
+    }
+    raf = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf)
+  }, [])
+
+  // 窗口移动 → debounce 后读窗口实际位置 → 更新引擎 → 恢复移动 → 持久化
+  useEffect(() => {
+    const win = getCurrentWindow()
+    let unlisten: (() => void) | undefined
+    let timer: number | null = null
+    const persist = async () => {
+      try {
+        const pos = await win.outerPosition()
+        const wa = workAreaRef.current
+        const p = petRef.current
+        if (!wa || !p) return
+        const x = pos.x - wa.x
+        const y = pos.y - wa.y
+        petRef.current = { ...p, x, y, mode: p.mode === 'dragging' ? 'walking' : p.mode }
+        await invoke('save_pet_position', { x, y, direction: p.direction }).catch(() => {})
+      } catch (e) {
+        console.error(e)
+      } finally {
+        draggingRef.current = false
+        movedRef.current = false
+      }
+    }
+    win.onMoved(() => {
+      movedRef.current = true
+      if (timer) window.clearTimeout(timer)
+      timer = window.setTimeout(persist, 200)
+    }).then((u) => { unlisten = u })
+    return () => { unlisten?.(); if (timer) window.clearTimeout(timer) }
+  }, [])
+
+  function handlePointerDown(e: PointerEvent) {
+    if (e.button !== 0) return
+    draggingRef.current = true
+    movedRef.current = false
+    if (petRef.current) petRef.current = { ...petRef.current, mode: 'dragging' }
+  }
+
+  function handlePointerUp() {
+    // 纯点击（窗口没动）时直接恢复；拖动由 onMoved 的 debounce 负责恢复
+    if (!movedRef.current) {
+      draggingRef.current = false
+      if (petRef.current && petRef.current.mode === 'dragging') {
+        petRef.current = { ...petRef.current, mode: 'walking' }
+      }
+    }
+    movedRef.current = false
+  }
+
+  return (
+    <div
+      className="native-pet"
+      title="拖拽可移动，从系统托盘导入或删除图片"
+      data-tauri-drag-region
+      onPointerDown={handlePointerDown}
+      onPointerUp={handlePointerUp}
+    >
+      {image
+        ? <img src={image.src} alt={`${image.name} 的桌宠`} draggable={false} />
+        : <div className="sample-pet" aria-label="抽象示例宠物"><i /><b /><em /></div>}
+    </div>
+  )
 }
 
 export default App
