@@ -86,3 +86,27 @@ describe('engine', () => {
     expect(clamp(99, 0, 10)).toBe(10)
   })
 })
+
+describe('engine · DPI 150% 物理坐标', () => {
+  // 1280×720 逻辑屏 @150% → 1920×1080 物理；窗口 260×320 逻辑 → 390×480 物理
+  const bounds: Bounds = { width: 1920, height: 1080 }
+  const size = { width: 390, height: 480 }
+
+  it('createPet 贴底且在屏幕内（y = 物理高度 - 物理 size，而非逻辑 size）', () => {
+    const pet = createPet(bounds, size)
+    expect(pet.y).toBe(1080 - 480) // 600，而不是 1080-160=920
+    expect(pet.y + size.height).toBeLessThanOrEqual(bounds.height)
+  })
+
+  it('长时间模拟窗口始终完整在屏幕内（不被丢到屏幕下方）', () => {
+    let pet = createPet(bounds, size)
+    const rng = mulberry32(7)
+    for (let i = 0; i < 20000; i++) {
+      pet = tick(pet, 16, rng)
+      expect(pet.y).toBeGreaterThanOrEqual(0)
+      expect(pet.y + size.height).toBeLessThanOrEqual(bounds.height)
+      expect(pet.x).toBeGreaterThanOrEqual(0)
+      expect(pet.x + size.width).toBeLessThanOrEqual(bounds.width)
+    }
+  })
+})

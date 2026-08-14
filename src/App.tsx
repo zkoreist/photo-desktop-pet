@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ChangeEvent, PointerEvent } from 'react'
+import type { ChangeEvent } from 'react'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import './App.css'
-import { createPet, tick, type PetState } from './features/pet/engine'
+import { clamp, createPet, tick, type PetState } from './features/pet/engine'
 
 const allowedTypes = ['image/png', 'image/jpeg', 'image/webp']
 const maxFileSize = 10 * 1024 * 1024
@@ -23,6 +23,7 @@ interface WorkArea {
   y: number
   width: number
   height: number
+  scale: number
 }
 
 function App() {
@@ -108,9 +109,10 @@ function App() {
 function DesktopPet() {
   const [image, setImage] = useState<{ src: string; name: string } | null>(null)
   const petRef = useRef<PetState | null>(null)
-  const workAreaRef = useRef<WorkArea>({ x: 0, y: 0, width: 860, height: 420 })
+  const workAreaRef = useRef<WorkArea>({ x: 0, y: 0, width: 860, height: 420, scale: 1 })
   const draggingRef = useRef(false)
   const movedRef = useRef(false)
+  const containerRef = useRef<HTMLDivElement>(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -121,26 +123,44 @@ function DesktopPet() {
     }
   }, [])
 
-  // 初始化：加载状态 + 工作区 + 就位
+  // 初始化：运行时动态探测（不假设任何 DPI），并对加载的位置做边界钳制
   useEffect(() => {
     let disposed = false
+    const win = getCurrentWindow()
     ;(async () => {
       try {
-        const [record, workArea] = await Promise.all([
+        const [record, workArea, winSize] = await Promise.all([
           invoke<PetRecord | null>('load_pet_state'),
           invoke<WorkArea>('get_work_area'),
+          win.outerSize(),
         ])
         if (disposed) return
         workAreaRef.current = workArea
-        const size = { width: 140, height: 160 }
+        // 引擎 size 用窗口物理尺寸，与 bounds（物理 work_area）单位一致
+        const size = { width: winSize.width, height: winSize.height }
+        const maxX = Math.max(0, workArea.width - size.width)
+        const maxY = Math.max(0, workArea.height - size.height)
+        console.log(
+          '[diagnostic] scale =', workArea.scale,
+          '| workArea =', workArea,
+          '| winSize(physical) =', size,
+          '| maxX/maxY =', maxX, '/', maxY,
+        )
         let pet = createPet({ width: workArea.width, height: workArea.height }, size)
         if (record?.x != null && record?.y != null) {
-          pet = { ...pet, x: record.x, y: record.y, direction: record.direction === -1 ? -1 : 1 }
+          // 校验并钳制保存的位置：不信任任何残留值，越界就拉回屏幕内
+          const x = clamp(record.x, 0, maxX)
+          const y = clamp(record.y, 0, maxY)
+          if (x !== record.x || y !== record.y) {
+            console.warn('[diagnostic] 保存的位置越界，已钳制：', { saved: { x: record.x, y: record.y }, clamped: { x, y } })
+          }
+          pet = { ...pet, x, y, direction: record.direction === -1 ? -1 : 1 }
         }
         petRef.current = pet
         if (record?.path) {
           setImage({ src: convertFileSrc(record.path), name: record.display_name ?? 'pet' })
         }
+        console.log('[diagnostic] initial pet pos =', { x: pet.x, y: pet.y })
         await invoke('set_pet_position', {
           x: Math.round(workArea.x + pet.x),
           y: Math.round(workArea.y + pet.y),
@@ -156,7 +176,7 @@ function DesktopPet() {
     return () => { disposed = true; un1?.(); un2?.() }
   }, [refresh])
 
-  // 动画循环：tick 引擎 + 节流同步窗口位置
+  // 动画循环：tick 引擎（物理坐标）+ 节流同步窗口位置
   useEffect(() => {
     let raf = 0
     let last = performance.now()
@@ -183,7 +203,7 @@ function DesktopPet() {
     return () => cancelAnimationFrame(raf)
   }, [])
 
-  // 窗口移动 → debounce 后读窗口实际位置 → 更新引擎 → 恢复移动 → 持久化
+  // 窗口移动（拖拽或引擎）→ debounce 后读实际位置 → 更新引擎 → 恢复 → 持久化
   useEffect(() => {
     const win = getCurrentWindow()
     let unlisten: (() => void) | undefined
@@ -196,6 +216,7 @@ function DesktopPet() {
         if (!wa || !p) return
         const x = pos.x - wa.x
         const y = pos.y - wa.y
+        console.log('[diagnostic] persist: outer =', pos, '→ engine x/y =', { x, y })
         petRef.current = { ...p, x, y, mode: p.mode === 'dragging' ? 'walking' : p.mode }
         await invoke('save_pet_position', { x, y, direction: p.direction }).catch(() => {})
       } catch (e) {
@@ -213,31 +234,40 @@ function DesktopPet() {
     return () => { unlisten?.(); if (timer) window.clearTimeout(timer) }
   }, [])
 
-  function handlePointerDown(e: PointerEvent) {
-    if (e.button !== 0) return
-    draggingRef.current = true
-    movedRef.current = false
-    if (petRef.current) petRef.current = { ...petRef.current, mode: 'dragging' }
-  }
-
-  function handlePointerUp() {
-    // 纯点击（窗口没动）时直接恢复；拖动由 onMoved 的 debounce 负责恢复
-    if (!movedRef.current) {
-      draggingRef.current = false
-      if (petRef.current && petRef.current.mode === 'dragging') {
-        petRef.current = { ...petRef.current, mode: 'walking' }
-      }
+  // 拖拽：原生 mousedown 监听，同步 startDragging（React 委托会错过 Windows 拖拽消息时机）
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const onMouseDown = (e: globalThis.MouseEvent) => {
+      if (e.button !== 0) return
+      draggingRef.current = true
+      movedRef.current = false
+      if (petRef.current) petRef.current = { ...petRef.current, mode: 'dragging' }
+      console.log('[diagnostic] mousedown → startDragging')
+      getCurrentWindow().startDragging().catch(() => {})
     }
-    movedRef.current = false
-  }
+    const onMouseUp = () => {
+      if (!movedRef.current) {
+        draggingRef.current = false
+        if (petRef.current && petRef.current.mode === 'dragging') {
+          petRef.current = { ...petRef.current, mode: 'walking' }
+        }
+      }
+      movedRef.current = false
+    }
+    el.addEventListener('mousedown', onMouseDown)
+    el.addEventListener('mouseup', onMouseUp)
+    return () => {
+      el.removeEventListener('mousedown', onMouseDown)
+      el.removeEventListener('mouseup', onMouseUp)
+    }
+  }, [])
 
   return (
     <div
+      ref={containerRef}
       className="native-pet"
       title="拖拽可移动，从系统托盘导入或删除图片"
-      data-tauri-drag-region
-      onPointerDown={handlePointerDown}
-      onPointerUp={handlePointerUp}
     >
       {image
         ? <img src={image.src} alt={`${image.name} 的桌宠`} draggable={false} />

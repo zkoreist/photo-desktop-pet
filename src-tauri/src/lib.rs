@@ -24,6 +24,7 @@ struct WorkArea {
     y: f64,
     width: f64,
     height: f64,
+    scale: f64,
 }
 
 fn pets_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -181,17 +182,24 @@ fn get_work_area(window: tauri::WebviewWindow) -> Result<WorkArea, String> {
         .or(window.primary_monitor().map_err(|e| e.to_string())?)
         .ok_or_else(|| "未检测到显示器".to_string())?;
     let wa = monitor.work_area();
+    let scale = monitor.scale_factor();
+    log::info!(
+        "[diagnostic] get_work_area: scale={scale}, work_area=({}, {}, {}x{})",
+        wa.position.x, wa.position.y, wa.size.width, wa.size.height
+    );
     Ok(WorkArea {
         x: wa.position.x as f64,
         y: wa.position.y as f64,
         width: wa.size.width as f64,
         height: wa.size.height as f64,
+        scale,
     })
 }
 
 #[tauri::command]
 fn set_pet_position(window: tauri::WebviewWindow, x: f64, y: f64) -> Result<(), String> {
     use tauri::Position;
+    log::info!("[diagnostic] set_pet_position: ({x}, {y})");
     window
         .set_position(Position::Physical(tauri::PhysicalPosition::new(
             x as i32, y as i32,
@@ -202,6 +210,7 @@ fn set_pet_position(window: tauri::WebviewWindow, x: f64, y: f64) -> Result<(), 
 #[tauri::command]
 fn get_pet_position(window: tauri::WebviewWindow) -> Result<(i32, i32), String> {
     let pos = window.outer_position().map_err(|e| e.to_string())?;
+    log::info!("[diagnostic] get_pet_position: ({}, {})", pos.x, pos.y);
     Ok((pos.x, pos.y))
 }
 
