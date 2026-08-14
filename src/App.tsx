@@ -27,7 +27,7 @@ interface WorkArea {
 }
 
 function App() {
-  const [pet, setPet] = useState<PetState>(() => createPet({ width: 860, height: 420 }))
+  const [pet, setPet] = useState<PetState>(() => createPet({ x: 0, y: 0, width: 860, height: 420 }))
   const [imageUrl, setImageUrl] = useState<string | null>(null)
   const [fileName, setFileName] = useState('示例宠物（仅演示）')
   const [notice, setNotice] = useState('导入一张你拥有使用权的透明 PNG，即可开始预览。')
@@ -109,9 +109,6 @@ function App() {
 function DesktopPet() {
   const [image, setImage] = useState<{ src: string; name: string } | null>(null)
   const petRef = useRef<PetState | null>(null)
-  const workAreaRef = useRef<WorkArea>({ x: 0, y: 0, width: 860, height: 420, scale: 1 })
-  const draggingRef = useRef(false)
-  const movedRef = useRef(false)
   const containerRef = useRef<HTMLDivElement>(null)
 
   const refresh = useCallback(async () => {
@@ -123,7 +120,7 @@ function DesktopPet() {
     }
   }, [])
 
-  // 初始化：运行时动态探测（不假设任何 DPI），并对加载的位置做边界钳制
+  // 初始化：运行时动态探测（不假设任何 DPI），统一屏幕绝对坐标
   useEffect(() => {
     let disposed = false
     const win = getCurrentWindow()
@@ -135,36 +132,29 @@ function DesktopPet() {
           win.outerSize(),
         ])
         if (disposed) return
-        workAreaRef.current = workArea
-        // 引擎 size 用窗口物理尺寸，与 bounds（物理 work_area）单位一致
         const size = { width: winSize.width, height: winSize.height }
-        const maxX = Math.max(0, workArea.width - size.width)
-        const maxY = Math.max(0, workArea.height - size.height)
-        console.log(
-          '[diagnostic] scale =', workArea.scale,
-          '| workArea =', workArea,
-          '| winSize(physical) =', size,
-          '| maxX/maxY =', maxX, '/', maxY,
-        )
-        let pet = createPet({ width: workArea.width, height: workArea.height }, size)
+        let bounds = workArea
+        let x = workArea.x + (workArea.width - size.width) / 2
+        let y = workArea.y + workArea.height - size.height
         if (record?.x != null && record?.y != null) {
-          // 校验并钳制保存的位置：不信任任何残留值，越界就拉回屏幕内
-          const x = clamp(record.x, 0, maxX)
-          const y = clamp(record.y, 0, maxY)
-          if (x !== record.x || y !== record.y) {
-            console.warn('[diagnostic] 保存的位置越界，已钳制：', { saved: { x: record.x, y: record.y }, clamped: { x, y } })
-          }
-          pet = { ...pet, x, y, direction: record.direction === -1 ? -1 : 1 }
+          // 用保存的屏幕绝对坐标；先移动窗口，再取窗口实际所在显示器的工作区
+          x = record.x
+          y = record.y
+          await invoke('set_pet_position', { x, y }).catch(() => {})
+          bounds = await invoke<WorkArea>('get_work_area').catch(() => workArea)
+          const maxX = Math.max(bounds.x, bounds.x + bounds.width - size.width)
+          const maxY = Math.max(bounds.y, bounds.y + bounds.height - size.height)
+          x = clamp(x, bounds.x, maxX)
+          y = clamp(y, bounds.y, maxY)
         }
+        console.log('[diagnostic] scale=', bounds.scale, '| bounds=', bounds, '| size=', size, '| pos=', { x, y })
+        let pet = createPet(bounds, size)
+        pet = { ...pet, x, y, direction: record?.direction === -1 ? -1 : 1 }
         petRef.current = pet
         if (record?.path) {
           setImage({ src: convertFileSrc(record.path), name: record.display_name ?? 'pet' })
         }
-        console.log('[diagnostic] initial pet pos =', { x: pet.x, y: pet.y })
-        await invoke('set_pet_position', {
-          x: Math.round(workArea.x + pet.x),
-          y: Math.round(workArea.y + pet.y),
-        }).catch(() => {})
+        await invoke('set_pet_position', { x: pet.x, y: pet.y }).catch(() => {})
       } catch (e) {
         console.error(e)
       }
@@ -176,7 +166,7 @@ function DesktopPet() {
     return () => { disposed = true; un1?.(); un2?.() }
   }, [refresh])
 
-  // 动画循环：tick 引擎（物理坐标）+ 节流同步窗口位置
+  // 动画循环：tick 引擎（屏幕绝对坐标）+ 节流同步窗口位置（拖拽期间由 Rust 控制窗口）
   useEffect(() => {
     let raf = 0
     let last = performance.now()
@@ -185,17 +175,13 @@ function DesktopPet() {
       const dt = now - last
       last = now
       const pet = petRef.current
-      if (pet && !draggingRef.current && pet.mode !== 'paused') {
+      if (pet && pet.mode !== 'dragging') {
         petRef.current = tick(pet, dt)
       }
       const p = petRef.current
-      if (p && !draggingRef.current && now - lastSync > 100) {
+      if (p && p.mode !== 'dragging' && now - lastSync > 100) {
         lastSync = now
-        const wa = workAreaRef.current
-        invoke('set_pet_position', {
-          x: Math.round(wa.x + p.x),
-          y: Math.round(wa.y + p.y),
-        }).catch(() => {})
+        invoke('set_pet_position', { x: Math.round(p.x), y: Math.round(p.y) }).catch(() => {})
       }
       raf = requestAnimationFrame(loop)
     }
@@ -203,64 +189,46 @@ function DesktopPet() {
     return () => cancelAnimationFrame(raf)
   }, [])
 
-  // 窗口移动（拖拽或引擎）→ debounce 后读实际位置 → 更新引擎 → 恢复 → 持久化
+  // 拖拽结束：同步位置 + 重新获取窗口所在显示器工作区 + 恢复走动
   useEffect(() => {
-    const win = getCurrentWindow()
-    let unlisten: (() => void) | undefined
-    let timer: number | null = null
-    const persist = async () => {
-      try {
-        const pos = await win.outerPosition()
-        const wa = workAreaRef.current
+    let un: (() => void) | undefined
+    listen<[number, number]>('drag-ended', (e) => {
+      const [x, y] = e.payload
+      ;(async () => {
+        const bounds = await invoke<WorkArea>('get_work_area').catch(() => null)
         const p = petRef.current
-        if (!wa || !p) return
-        const x = pos.x - wa.x
-        const y = pos.y - wa.y
-        console.log('[diagnostic] persist: outer =', pos, '→ engine x/y =', { x, y })
-        petRef.current = { ...p, x, y, mode: p.mode === 'dragging' ? 'walking' : p.mode }
-        await invoke('save_pet_position', { x, y, direction: p.direction }).catch(() => {})
-      } catch (e) {
-        console.error(e)
-      } finally {
-        draggingRef.current = false
-        movedRef.current = false
-      }
-    }
-    win.onMoved(() => {
-      movedRef.current = true
-      if (timer) window.clearTimeout(timer)
-      timer = window.setTimeout(persist, 200)
-    }).then((u) => { unlisten = u })
-    return () => { unlisten?.(); if (timer) window.clearTimeout(timer) }
+        if (!p) return
+        const nextBounds = bounds ?? p.bounds
+        const maxX = Math.max(nextBounds.x, nextBounds.x + nextBounds.width - p.size.width)
+        const maxY = Math.max(nextBounds.y, nextBounds.y + nextBounds.height - p.size.height)
+        petRef.current = {
+          ...p,
+          bounds: nextBounds,
+          x: clamp(x, nextBounds.x, maxX),
+          y: clamp(y, nextBounds.y, maxY),
+          mode: 'walking',
+        }
+        console.log('[diagnostic] drag-ended →', { x, y })
+      })()
+    }).then((u) => { un = u })
+    return () => { un?.() }
   }, [])
 
-  // 拖拽：原生 mousedown 监听，同步 startDragging（React 委托会错过 Windows 拖拽消息时机）
+  // 鼠标按下：进入 PRESSED，交给 Rust 层拖拽状态机
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
     const onMouseDown = (e: globalThis.MouseEvent) => {
       if (e.button !== 0) return
-      draggingRef.current = true
-      movedRef.current = false
       if (petRef.current) petRef.current = { ...petRef.current, mode: 'dragging' }
-      console.log('[diagnostic] mousedown → startDragging')
-      getCurrentWindow().startDragging().catch(() => {})
-    }
-    const onMouseUp = () => {
-      if (!movedRef.current) {
-        draggingRef.current = false
+      invoke('begin_press').catch(() => {
         if (petRef.current && petRef.current.mode === 'dragging') {
           petRef.current = { ...petRef.current, mode: 'walking' }
         }
-      }
-      movedRef.current = false
+      })
     }
     el.addEventListener('mousedown', onMouseDown)
-    el.addEventListener('mouseup', onMouseUp)
-    return () => {
-      el.removeEventListener('mousedown', onMouseDown)
-      el.removeEventListener('mouseup', onMouseUp)
-    }
+    return () => el.removeEventListener('mousedown', onMouseDown)
   }, [])
 
   return (

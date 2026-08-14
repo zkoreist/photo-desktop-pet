@@ -5,11 +5,13 @@ use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
+mod drag;
+
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
 /// 持久化的宠物状态：图片引用（可选）+ 窗口位置（可选）。
 #[derive(Serialize, Deserialize, Clone, Default)]
-struct PetState {
+pub(crate) struct PetState {
     file_name: Option<String>,
     display_name: Option<String>,
     path: Option<String>,
@@ -105,12 +107,12 @@ fn import_blocking(app: &tauri::AppHandle) -> Result<PetState, String> {
     Ok(state)
 }
 
-fn write_state(app: &tauri::AppHandle, state: &PetState) -> Result<(), String> {
+pub(crate) fn write_state(app: &tauri::AppHandle, state: &PetState) -> Result<(), String> {
     let json = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
     std::fs::write(state_file(app)?, json).map_err(|e| format!("保存状态失败: {e}"))
 }
 
-fn load_state(app: &tauri::AppHandle) -> Result<Option<PetState>, String> {
+pub(crate) fn load_state(app: &tauri::AppHandle) -> Result<Option<PetState>, String> {
     let path = state_file(app)?;
     if !path.exists() {
         return Ok(None);
@@ -162,15 +164,6 @@ async fn delete_pet_image(app: tauri::AppHandle, file_name: String) -> Result<()
 #[tauri::command]
 fn load_pet_state(app: tauri::AppHandle) -> Result<Option<PetState>, String> {
     load_state(&app)
-}
-
-#[tauri::command]
-fn save_pet_position(app: tauri::AppHandle, x: f64, y: f64, direction: i32) -> Result<(), String> {
-    let mut state = load_state(&app)?.unwrap_or_default();
-    state.x = Some(x);
-    state.y = Some(y);
-    state.direction = Some(direction);
-    write_state(&app, &state)
 }
 
 /// 返回当前显示器的工作区（已排除任务栏），单位物理像素。
@@ -225,10 +218,10 @@ pub fn run() {
             import_pet_image,
             delete_pet_image,
             load_pet_state,
-            save_pet_position,
             get_work_area,
             set_pet_position,
-            get_pet_position
+            get_pet_position,
+            drag::begin_press
         ])
         .setup(|app| {
             let show_hide = MenuItem::with_id(app, "show-hide", "显示 / 隐藏", true, None::<&str>)?;

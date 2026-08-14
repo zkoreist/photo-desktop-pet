@@ -5,7 +5,14 @@ export interface Size {
   height: number
 }
 
+/**
+ * 工作区边界，统一使用「屏幕绝对坐标」（物理像素）：
+ * x/y 是工作区左上角的屏幕坐标，width/height 是工作区尺寸。
+ * 这样引擎、拖拽、窗口位置三者坐标体系统一，天然支持多显示器负坐标。
+ */
 export interface Bounds {
+  x: number
+  y: number
   width: number
   height: number
 }
@@ -47,8 +54,8 @@ export function mulberry32(seed: number): Rng {
 
 export function createPet(bounds: Bounds, size: Size = { width: 140, height: 160 }): PetState {
   return {
-    x: clamp((bounds.width - size.width) / 2, 0, Math.max(0, bounds.width - size.width)),
-    y: Math.max(0, bounds.height - size.height),
+    x: bounds.x + clamp((bounds.width - size.width) / 2, 0, Math.max(0, bounds.width - size.width)),
+    y: bounds.y + Math.max(0, bounds.height - size.height),
     vy: 0,
     direction: 1,
     speed: 68,
@@ -62,16 +69,19 @@ export function createPet(bounds: Bounds, size: Size = { width: 140, height: 160
 
 /**
  * 推进宠物状态一帧。
- * - paused / dragging：不产生自主移动，原样返回（拖拽期间禁用自主运动）。
+ * - paused / dragging：不产生自主移动，原样返回。
  * - walking：水平移动 + 边界反弹；垂直方向受重力、落地后有机会随机起跳。
  * - idle：计时结束后随机方向恢复 walking。
- * - 时间步长被 clamp 到 [0, 100]ms，避免大跳变。
+ * - 时间步长被 clamp 到 [0, 100]ms。
+ * 所有坐标均为屏幕绝对坐标，宠物被约束在 bounds 内（含 x/y 偏移）。
  */
 export function tick(pet: PetState, elapsedMs: number, rng: Rng = Math.random): PetState {
   if (pet.mode === 'paused' || pet.mode === 'dragging') return pet
   const dt = Math.min(Math.max(elapsedMs, 0), 100) / 1000
-  const maxX = Math.max(0, pet.bounds.width - pet.size.width)
-  const maxY = Math.max(0, pet.bounds.height - pet.size.height)
+  const minX = pet.bounds.x
+  const minY = pet.bounds.y
+  const maxX = pet.bounds.x + Math.max(0, pet.bounds.width - pet.size.width)
+  const maxY = pet.bounds.y + Math.max(0, pet.bounds.height - pet.size.height)
 
   if (pet.mode === 'idle') {
     const idleTimer = pet.idleTimer - elapsedMs
@@ -90,12 +100,12 @@ export function tick(pet: PetState, elapsedMs: number, rng: Rng = Math.random): 
   // 水平移动 + 边界反弹
   let x = pet.x + pet.direction * pet.speed * dt
   let direction = pet.direction
-  if (x < 0 || x > maxX) {
-    x = clamp(x, 0, maxX)
+  if (x < minX || x > maxX) {
+    x = clamp(x, minX, maxX)
     direction = direction === 1 ? -1 : 1
   }
 
-  // 垂直：重力 + 落地
+  // 垂直：重力 + 落地 + 顶部边界
   let y = pet.y + pet.vy * dt
   let vy = pet.vy + GRAVITY * dt
   let onGround = false
@@ -103,6 +113,9 @@ export function tick(pet: PetState, elapsedMs: number, rng: Rng = Math.random): 
     y = maxY
     vy = 0
     onGround = true
+  } else if (y < minY) {
+    y = minY
+    if (vy < 0) vy = 0
   }
 
   let mode: PetMode = 'walking'

@@ -2271,6 +2271,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-log",
  "uuid",
+ "windows",
 ]
 
 [[package]]
